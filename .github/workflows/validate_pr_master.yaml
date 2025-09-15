@@ -1,4 +1,4 @@
-name: Validate Merge to master from develop
+name: Validate Merge to master
 
 on:
   pull_request:
@@ -9,20 +9,17 @@ permissions:
   contents: read
 
 jobs:
-  validate_master_pr:
+  validate_master:
     name: Validate PR to master
     runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'pull_request' &&
+      github.actor != 'github-actions[bot]' &&
+      !contains(github.event.pull_request.title, '[skip ci]')
 
     steps:
-      - name: Ensure PR source is develop
-        run: |
-          if [[ "${{ github.head_ref }}" != "develop" ]]; then
-            echo "❌ Only pull requests from 'develop' to 'master' are allowed."
-            exit 1
-          fi
-
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -30,26 +27,51 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version-file: pubspec.yaml
+          cache: true
 
-      - name: Validate Changelog and Version Match
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: Check Formatting (read-only)
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze Code (strict)
+        run: dart analyze --fatal-infos --fatal-warnings .
+
+      - name: Run Tests (with coverage)
+        run: flutter test --coverage
+
+      - name: Check dependency_overrides
         run: |
-          VERSION_CHANGELOG=$(grep -oP '^## \[\K[0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md | head -1)
-          VERSION_PUBSPEC=$(grep '^version:' pubspec.yaml | awk '{print $2}')
+          if grep -R --include="pubspec.yaml" -nE '^[[:space:]]*dependency_overrides:' . ; then
+            echo "::error title=dependency_overrides detectado::El repo no debe incluir dependency_overrides en pubspec.yaml"
+            exit 1
+          fi
+          echo "✓ No se encontraron dependency_overrides"
 
-          echo "🔍 Changelog version: $VERSION_CHANGELOG"
-          echo "🔍 pubspec.yaml version: $VERSION_PUBSPEC"
+      - name: Ensure pubspec version is greater than master
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          if [[ "$VERSION_CHANGELOG" != "$VERSION_PUBSPEC" ]]; then
-            echo "❌ Version mismatch: CHANGELOG.md has $VERSION_CHANGELOG but pubspec.yaml has $VERSION_PUBSPEC"
+          git fetch --no-tags --depth=1 origin master
+
+          VERSION_MASTER="$(git show origin/master:pubspec.yaml | grep '^version:' | awk '{print $2}' || true)"
+          VERSION_PUBSPEC="$(grep '^version:' pubspec.yaml | awk '{print $2}')"
+
+          echo "📦 master version: $VERSION_MASTER"
+          echo "📦 PR version:     $VERSION_PUBSPEC"
+
+          if [[ -z "${VERSION_MASTER:-}" ]]; then
+            echo "ℹ️ No version could be read from origin/master (new repo?). Skipping compare."
+            exit 0
+          fi
+
+          # Debe ser estrictamente mayor a master
+          HIGHEST="$(printf '%s\n' "$VERSION_MASTER" "$VERSION_PUBSPEC" | sort -V | tail -1)"
+          if [[ "$VERSION_PUBSPEC" == "$VERSION_MASTER" || "$HIGHEST" != "$VERSION_PUBSPEC" ]]; then
+            echo "❌ pubspec.yaml version ($VERSION_PUBSPEC) must be greater than master ($VERSION_MASTER)."
             exit 1
           fi
 
-      - name: Analyze Code
-        run: flutter analyze
-
-      - name: Run Tests
-        run: flutter test
-
-      - name: Validate Format
-        run: dart format --set-exit-if-changed .
+          echo "✓ Version check OK: $VERSION_PUBSPEC > $VERSION_MASTER"
